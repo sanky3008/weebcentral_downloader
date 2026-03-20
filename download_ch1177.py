@@ -66,17 +66,19 @@ def find_chapter_images(manga_dir):
     return None
 
 
+def is_wide(filepath):
+    """Check if an image is landscape/wide (likely a double-page spread)."""
+    with Image.open(filepath) as img:
+        return img.width > img.height
+
+
 def create_landscape_spread_pdf(image_dir, output_path):
     """
-    Create a landscape PDF with 2 manga pages per sheet.
+    Create a landscape PDF with smart double-spread detection.
 
-    - First page is placed alone on the right side of the first sheet
-      (this ensures subsequent pages pair correctly for double spreads).
-    - Remaining pages are paired: [2,3], [4,5], [6,7], etc.
-    - Within each sheet, pages are placed RIGHT then LEFT (manga order):
-      right side = earlier page, left side = later page.
-    - Each page is scaled to fit its half of the landscape sheet while
-      maintaining aspect ratio.
+    - Wide/landscape images (Oda's double spreads) get their own FULL sheet
+    - Portrait pages are paired two-per-sheet in manga order (right-to-left)
+    - First portrait page is solo on right side to maintain odd/even alignment
     """
     image_files = sorted([
         os.path.join(image_dir, f)
@@ -88,44 +90,73 @@ def create_landscape_spread_pdf(image_dir, output_path):
         print("ERROR: No images found!")
         return
 
-    print(f"Found {len(image_files)} pages. Creating landscape spread PDF...")
+    print(f"Found {len(image_files)} pages. Detecting spreads...")
 
-    # Build page pairs: first page alone, then pairs of 2
-    # Page 1 alone (on right side), then [2,3], [4,5], etc.
-    pairs = []
-    pairs.append((image_files[0], None))  # First page solo (right side only)
+    # Classify each page
+    wide_pages = set()
+    for f in image_files:
+        if is_wide(f):
+            wide_pages.add(f)
+            print(f"   Wide spread detected: {os.path.basename(f)}")
 
-    i = 1
-    while i < len(image_files):
-        right_page = image_files[i]
-        left_page = image_files[i + 1] if i + 1 < len(image_files) else None
-        pairs.append((right_page, left_page))
-        i += 2
+    # Build sheet plan:
+    # - Wide images -> solo full sheet
+    # - Portrait images -> pair up, first one solo to maintain alignment
+    sheets_plan = []  # list of (right_path, left_path) or (wide_path, 'FULL')
+    portrait_buffer = []
+
+    def flush_portraits():
+        nonlocal portrait_buffer
+        if not portrait_buffer:
+            return
+        i = 0
+        while i < len(portrait_buffer):
+            right = portrait_buffer[i]
+            left = portrait_buffer[i + 1] if i + 1 < len(portrait_buffer) else None
+            sheets_plan.append((right, left))
+            i += 2
+        portrait_buffer = []
+
+    for f in image_files:
+        if f in wide_pages:
+            flush_portraits()
+            sheets_plan.append((f, 'FULL'))
+        else:
+            portrait_buffer.append(f)
+
+    flush_portraits()
 
     sheets = []
     half_width = LANDSCAPE_WIDTH // 2
 
-    for right_path, left_path in pairs:
-        # Create landscape canvas (white background)
+    for right_path, left_path in sheets_plan:
         sheet = Image.new('RGB', (LANDSCAPE_WIDTH, LANDSCAPE_HEIGHT), (255, 255, 255))
 
-        # Place right page (manga: this is read first)
-        right_img = Image.open(right_path).convert('RGB')
-        right_img = scale_to_fit(right_img, half_width, LANDSCAPE_HEIGHT)
-        # Center in right half
-        x_offset = half_width + (half_width - right_img.width) // 2
-        y_offset = (LANDSCAPE_HEIGHT - right_img.height) // 2
-        sheet.paste(right_img, (x_offset, y_offset))
-        right_img.close()
+        if left_path == 'FULL':
+            # Wide spread — scale to fill the entire sheet
+            wide_img = Image.open(right_path).convert('RGB')
+            wide_img = scale_to_fit(wide_img, LANDSCAPE_WIDTH, LANDSCAPE_HEIGHT)
+            x_offset = (LANDSCAPE_WIDTH - wide_img.width) // 2
+            y_offset = (LANDSCAPE_HEIGHT - wide_img.height) // 2
+            sheet.paste(wide_img, (x_offset, y_offset))
+            wide_img.close()
+        else:
+            # Right half (read first in manga)
+            right_img = Image.open(right_path).convert('RGB')
+            right_img = scale_to_fit(right_img, half_width, LANDSCAPE_HEIGHT)
+            x_offset = half_width + (half_width - right_img.width) // 2
+            y_offset = (LANDSCAPE_HEIGHT - right_img.height) // 2
+            sheet.paste(right_img, (x_offset, y_offset))
+            right_img.close()
 
-        # Place left page if exists
-        if left_path:
-            left_img = Image.open(left_path).convert('RGB')
-            left_img = scale_to_fit(left_img, half_width, LANDSCAPE_HEIGHT)
-            x_offset = (half_width - left_img.width) // 2
-            y_offset = (LANDSCAPE_HEIGHT - left_img.height) // 2
-            sheet.paste(left_img, (x_offset, y_offset))
-            left_img.close()
+            # Left half
+            if left_path:
+                left_img = Image.open(left_path).convert('RGB')
+                left_img = scale_to_fit(left_img, half_width, LANDSCAPE_HEIGHT)
+                x_offset = (half_width - left_img.width) // 2
+                y_offset = (LANDSCAPE_HEIGHT - left_img.height) // 2
+                sheet.paste(left_img, (x_offset, y_offset))
+                left_img.close()
 
         sheets.append(sheet)
 
@@ -134,18 +165,19 @@ def create_landscape_spread_pdf(image_dir, output_path):
         sheets[0].save(
             output_path,
             "PDF",
-            resolution=226.0,  # reMarkable 2 DPI
+            resolution=226.0,
             save_all=True,
             append_images=sheets[1:],
         )
-        # Clean up
         for s in sheets:
             s.close()
 
+    wide_count = sum(1 for _, lp in sheets_plan if lp == 'FULL')
+    paired_count = len(sheets_plan) - wide_count
     print(f"Landscape spread PDF saved: {output_path}")
     print(f"  - {len(sheets)} sheets total")
-    print(f"  - First page is solo (right side)")
-    print(f"  - Remaining pages paired for double-spread viewing")
+    print(f"  - {wide_count} full-width double spreads")
+    print(f"  - {paired_count} paired portrait sheets")
 
 
 def scale_to_fit(img, max_width, max_height):
